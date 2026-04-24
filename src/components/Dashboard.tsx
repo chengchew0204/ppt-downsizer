@@ -7,6 +7,7 @@ import JSZip from "jszip";
 
 import { GlobalControls } from "@/components/GlobalControls";
 import { ImageCard, type ImageState } from "@/components/ImageCard";
+import { ImageDetailModal } from "@/components/ImageDetailModal";
 import { Button } from "@/components/ui/button";
 import { compressImageBlob } from "@/lib/image-compression";
 import {
@@ -17,6 +18,7 @@ import {
 import { formatBytes } from "@/lib/utils";
 
 const DEBOUNCE_MS = 300;
+const DEFAULT_RATIO = 0.5;
 
 type DashboardProps = {
   file: File;
@@ -25,30 +27,48 @@ type DashboardProps = {
   onReset: () => void;
 };
 
+function makeInitialState(): ImageState {
+  return {
+    ratio: DEFAULT_RATIO,
+    estimatedSize: null,
+    isEstimating: false,
+    estimateError: null,
+    compressedPreviewUrl: null,
+    status: null,
+  };
+}
+
 export function Dashboard({ file, zip, images, onReset }: DashboardProps) {
-  const [globalRatio, setGlobalRatio] = useState(0.7);
+  const [globalRatio, setGlobalRatio] = useState(DEFAULT_RATIO);
   const [states, setStates] = useState<Record<string, ImageState>>(() =>
-    Object.fromEntries(
-      images.map((img) => [
-        img.id,
-        {
-          ratio: 0.7,
-          estimatedSize: null,
-          isEstimating: false,
-          estimateError: null,
-        } as ImageState,
-      ])
-    )
+    Object.fromEntries(images.map((img) => [img.id, makeInitialState()]))
   );
   const [compressedBlobs, setCompressedBlobs] = useState<Map<string, Blob>>(
     new Map()
   );
   const [exporting, setExporting] = useState(false);
+  const [openImageId, setOpenImageId] = useState<string | null>(null);
 
   const debounceTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(
     new Map()
   );
   const requestIds = useRef<Map<string, number>>(new Map());
+  const previewUrls = useRef<Map<string, string>>(new Map());
+
+  const setPreviewUrl = useCallback(
+    (imageId: string, blob: Blob | null) => {
+      const prev = previewUrls.current.get(imageId);
+      if (prev) URL.revokeObjectURL(prev);
+      if (!blob) {
+        previewUrls.current.delete(imageId);
+        return null;
+      }
+      const url = URL.createObjectURL(blob);
+      previewUrls.current.set(imageId, url);
+      return url;
+    },
+    []
+  );
 
   const runEstimate = useCallback(
     (image: MediaImage, ratio: number) => {
@@ -60,6 +80,8 @@ export function Dashboard({ file, zip, images, onReset }: DashboardProps) {
             estimatedSize: image.originalSize,
             isEstimating: false,
             estimateError: null,
+            compressedPreviewUrl: null,
+            status: "vector" as const,
           },
         }));
         setCompressedBlobs((prev) => {
@@ -83,10 +105,14 @@ export function Dashboard({ file, zip, images, onReset }: DashboardProps) {
       }));
 
       compressImageBlob(image.originalBlob, { ratio })
-        .then((blob) => {
+        .then((result) => {
           if (requestIds.current.get(image.id) !== reqId) return;
-          const finalBlob =
-            blob.size < image.originalSize ? blob : image.originalBlob;
+          const useCompressed = result.status === "compressed";
+          const finalBlob = useCompressed ? result.blob : image.originalBlob;
+          const previewUrl = setPreviewUrl(
+            image.id,
+            useCompressed ? result.blob : null
+          );
           setCompressedBlobs((prev) => {
             const next = new Map(prev);
             next.set(image.id, finalBlob);
@@ -99,6 +125,8 @@ export function Dashboard({ file, zip, images, onReset }: DashboardProps) {
               estimatedSize: finalBlob.size,
               isEstimating: false,
               estimateError: null,
+              compressedPreviewUrl: previewUrl,
+              status: result.status,
             },
           }));
         })
@@ -115,7 +143,7 @@ export function Dashboard({ file, zip, images, onReset }: DashboardProps) {
           }));
         });
     },
-    []
+    [setPreviewUrl]
   );
 
   const scheduleEstimate = useCallback(
@@ -134,14 +162,17 @@ export function Dashboard({ file, zip, images, onReset }: DashboardProps) {
   useEffect(() => {
     const handle = setTimeout(() => {
       for (const image of images) {
-        runEstimate(image, 0.7);
+        runEstimate(image, DEFAULT_RATIO);
       }
     }, 0);
     const timers = debounceTimers.current;
+    const urls = previewUrls.current;
     return () => {
       clearTimeout(handle);
       for (const timer of timers.values()) clearTimeout(timer);
       timers.clear();
+      for (const url of urls.values()) URL.revokeObjectURL(url);
+      urls.clear();
     };
   }, [images, runEstimate]);
 
@@ -225,6 +256,11 @@ export function Dashboard({ file, zip, images, onReset }: DashboardProps) {
   }, [compressedBlobs, file.name, images, zip]);
 
   const anyEstimating = Object.values(states).some((s) => s.isEstimating);
+
+  const openImage = openImageId
+    ? images.find((i) => i.id === openImageId) ?? null
+    : null;
+  const openState = openImageId ? states[openImageId] : undefined;
 
   if (images.length === 0) {
     return (
@@ -350,9 +386,19 @@ export function Dashboard({ file, zip, images, onReset }: DashboardProps) {
             image={image}
             state={states[image.id]}
             onRatioChange={(ratio) => handleRatioChange(image.id, ratio)}
+            onOpen={() => setOpenImageId(image.id)}
           />
         ))}
       </motion.div>
+
+      <ImageDetailModal
+        image={openImage}
+        state={openState}
+        onClose={() => setOpenImageId(null)}
+        onRatioChange={(ratio) =>
+          openImage && handleRatioChange(openImage.id, ratio)
+        }
+      />
     </div>
   );
 }

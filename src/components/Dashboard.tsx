@@ -553,10 +553,14 @@ function SortControl({
         value={value}
         onChange={(e) => onChange(e.target.value as SortOption)}
         aria-label="Sort images"
-        className="absolute inset-0 cursor-pointer appearance-none opacity-0"
+        className="absolute inset-0 cursor-pointer appearance-none bg-transparent text-transparent opacity-0 [color-scheme:light] dark:[color-scheme:dark]"
       >
         {SORT_OPTIONS.map((option) => (
-          <option key={option.value} value={option.value}>
+          <option
+            key={option.value}
+            value={option.value}
+            className="bg-white text-zinc-900 dark:bg-zinc-900 dark:text-zinc-50"
+          >
             {option.label}
           </option>
         ))}

@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect } from "react";
-import Image from "next/image";
 import { AnimatePresence, motion } from "framer-motion";
 import { Loader2, TrendingDown, TrendingUp, X } from "lucide-react";
 
@@ -102,13 +101,11 @@ export function ImageDetailModal({
                     Vector (.svg) assets aren&apos;t re-encoded.
                   </div>
                 ) : (
-                  <Image
+                  <img
                     src={state.compressedPreviewUrl ?? image.previewUrl}
                     alt={image.name}
-                    fill
-                    unoptimized
-                    sizes="(max-width: 1024px) 100vw, 70vw"
-                    className="object-contain"
+                    decoding="async"
+                    className="absolute inset-0 h-full w-full object-contain"
                   />
                 )}
                 {state.isEstimating && (

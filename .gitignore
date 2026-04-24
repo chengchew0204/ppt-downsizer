@@ -39,3 +39,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# generated standalone HTML (built from `npm run build:standalone`)
+/standalone-dist/
+/public/ppt-downsizer.html

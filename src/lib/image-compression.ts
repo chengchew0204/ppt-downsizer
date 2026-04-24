@@ -11,7 +11,8 @@
  *      factor, so even images that are already below the cap still shrink
  *      when the user picks a low ratio.
  *   4. For opaque images, encode as JPEG. For images with real alpha,
- *      encode as WebP (lossy, supports alpha) whenever it beats PNG.
+ *      encode as PNG. We deliberately do not emit WebP - it isn't in the
+ *      OOXML image family and PowerPoint for the Web refuses to render it.
  *   5. Always compare against the source blob. If the re-encoded result
  *      is still larger, fall back to the source and mark the image as
  *      "already optimal" so the UI can communicate that clearly.
@@ -218,14 +219,13 @@ export async function compressImageBlob(
     const mightHaveAlpha = couldHaveAlpha(source.type);
     const hasAlpha = mightHaveAlpha ? detectAlpha(ctx, targetW, targetH) : false;
 
+    // We intentionally only emit formats that the OOXML spec and all
+    // PowerPoint clients (desktop, Mac, web, Keynote, LibreOffice) accept:
+    // PNG for transparency, JPEG for opaque. WebP is NOT in the ECMA-376
+    // image list and breaks PowerPoint for the Web.
     const candidates: Blob[] = [];
 
     if (hasAlpha) {
-      try {
-        candidates.push(await canvasToBlob(canvas, "image/webp", quality));
-      } catch {
-        // ignore WebP failures, fall back to PNG below
-      }
       try {
         candidates.push(await canvasToBlob(canvas, "image/png", undefined));
       } catch {
@@ -247,20 +247,10 @@ export async function compressImageBlob(
       } catch {
         // ignore
       }
-      try {
-        candidates.push(await canvasToBlob(flat, "image/webp", quality));
-      } catch {
-        // ignore
-      }
     }
 
-    // Only accept candidates the browser actually encoded in the requested
-    // format. Safari may silently fall back to PNG for WebP, etc.
     const valid = candidates.filter(
-      (c) =>
-        c.type === "image/webp" ||
-        c.type === "image/png" ||
-        c.type === "image/jpeg"
+      (c) => c.type === "image/png" || c.type === "image/jpeg"
     );
     if (valid.length === 0) {
       return {

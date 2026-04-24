@@ -2,7 +2,17 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
-import { Download, ImageOff, Loader2, RotateCcw, Zap } from "lucide-react";
+import {
+  ArrowDownAZ,
+  ArrowDownWideNarrow,
+  ArrowUpAZ,
+  ArrowUpNarrowWide,
+  Download,
+  ImageOff,
+  Loader2,
+  RotateCcw,
+  Zap,
+} from "lucide-react";
 import JSZip from "jszip";
 
 import { GlobalControls } from "@/components/GlobalControls";
@@ -19,6 +29,70 @@ import { formatBytes } from "@/lib/utils";
 
 const DEBOUNCE_MS = 300;
 const DEFAULT_RATIO = 0.5;
+
+const SORT_OPTIONS = [
+  {
+    value: "name-asc",
+    label: "Name (A to Z)",
+    icon: ArrowDownAZ,
+  },
+  {
+    value: "name-desc",
+    label: "Name (Z to A)",
+    icon: ArrowUpAZ,
+  },
+  {
+    value: "size-desc",
+    label: "Size (largest first)",
+    icon: ArrowDownWideNarrow,
+  },
+  {
+    value: "size-asc",
+    label: "Size (smallest first)",
+    icon: ArrowUpNarrowWide,
+  },
+  {
+    value: "savings-desc",
+    label: "Savings (largest first)",
+    icon: ArrowDownWideNarrow,
+  },
+] as const;
+
+type SortOption = (typeof SORT_OPTIONS)[number]["value"];
+
+function compareImagesBy(
+  option: SortOption,
+  states: Record<string, ImageState>
+) {
+  const collator = new Intl.Collator(undefined, { numeric: true });
+
+  return (a: MediaImage, b: MediaImage): number => {
+    switch (option) {
+      case "name-asc":
+        return collator.compare(a.name, b.name);
+      case "name-desc":
+        return collator.compare(b.name, a.name);
+      case "size-desc":
+        if (b.originalSize !== a.originalSize)
+          return b.originalSize - a.originalSize;
+        return collator.compare(a.name, b.name);
+      case "size-asc":
+        if (a.originalSize !== b.originalSize)
+          return a.originalSize - b.originalSize;
+        return collator.compare(a.name, b.name);
+      case "savings-desc": {
+        const savingsA =
+          a.originalSize - (states[a.id]?.estimatedSize ?? a.originalSize);
+        const savingsB =
+          b.originalSize - (states[b.id]?.estimatedSize ?? b.originalSize);
+        if (savingsA !== savingsB) return savingsB - savingsA;
+        return collator.compare(a.name, b.name);
+      }
+      default:
+        return 0;
+    }
+  };
+}
 
 type DashboardProps = {
   file: File;
@@ -48,6 +122,7 @@ export function Dashboard({ file, zip, images, onReset }: DashboardProps) {
   );
   const [exporting, setExporting] = useState(false);
   const [openImageId, setOpenImageId] = useState<string | null>(null);
+  const [sortOption, setSortOption] = useState<SortOption>("name-asc");
 
   const debounceTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(
     new Map()
@@ -257,6 +332,10 @@ export function Dashboard({ file, zip, images, onReset }: DashboardProps) {
 
   const anyEstimating = Object.values(states).some((s) => s.isEstimating);
 
+  const sortedImages = useMemo(() => {
+    return [...images].sort(compareImagesBy(sortOption, states));
+  }, [images, sortOption, states]);
+
   const openImage = openImageId
     ? images.find((i) => i.id === openImageId) ?? null
     : null;
@@ -376,11 +455,18 @@ export function Dashboard({ file, zip, images, onReset }: DashboardProps) {
         </Button>
       </div>
 
+      <div className="flex flex-col-reverse items-start justify-between gap-3 sm:flex-row sm:items-center">
+        <div className="text-sm font-medium text-zinc-700 dark:text-zinc-200">
+          {images.length} {images.length === 1 ? "image" : "images"}
+        </div>
+        <SortControl value={sortOption} onChange={setSortOption} />
+      </div>
+
       <motion.div
         layout
         className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
       >
-        {images.map((image) => (
+        {sortedImages.map((image) => (
           <ImageCard
             key={image.id}
             image={image}
@@ -443,5 +529,42 @@ function SummaryStat({
         </div>
       )}
     </div>
+  );
+}
+
+function SortControl({
+  value,
+  onChange,
+}: {
+  value: SortOption;
+  onChange: (value: SortOption) => void;
+}) {
+  const active = SORT_OPTIONS.find((o) => o.value === value) ?? SORT_OPTIONS[0];
+  const ActiveIcon = active.icon;
+
+  return (
+    <label className="group relative inline-flex items-center gap-2 rounded-full border border-zinc-200 bg-white px-3 py-1.5 text-xs font-medium text-zinc-700 shadow-sm transition-colors hover:border-zinc-300 hover:text-zinc-950 focus-within:ring-2 focus-within:ring-zinc-950 focus-within:ring-offset-2 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-200 dark:hover:border-zinc-700 dark:hover:text-white dark:focus-within:ring-zinc-300">
+      <ActiveIcon className="h-3.5 w-3.5" />
+      <span className="text-[11px] uppercase tracking-wide text-zinc-400 dark:text-zinc-500">
+        Sort by
+      </span>
+      <span className="text-zinc-900 dark:text-zinc-50">{active.label}</span>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value as SortOption)}
+        aria-label="Sort images"
+        className="absolute inset-0 cursor-pointer appearance-none bg-transparent text-transparent opacity-0 [color-scheme:light] dark:[color-scheme:dark]"
+      >
+        {SORT_OPTIONS.map((option) => (
+          <option
+            key={option.value}
+            value={option.value}
+            className="bg-white text-zinc-900 dark:bg-zinc-900 dark:text-zinc-50"
+          >
+            {option.label}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }

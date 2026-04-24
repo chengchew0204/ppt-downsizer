@@ -34,6 +34,7 @@ function makeInitialState(): ImageState {
     isEstimating: false,
     estimateError: null,
     compressedPreviewUrl: null,
+    status: null,
   };
 }
 
@@ -80,6 +81,7 @@ export function Dashboard({ file, zip, images, onReset }: DashboardProps) {
             isEstimating: false,
             estimateError: null,
             compressedPreviewUrl: null,
+            status: "vector" as const,
           },
         }));
         setCompressedBlobs((prev) => {
@@ -103,13 +105,13 @@ export function Dashboard({ file, zip, images, onReset }: DashboardProps) {
       }));
 
       compressImageBlob(image.originalBlob, { ratio })
-        .then((blob) => {
+        .then((result) => {
           if (requestIds.current.get(image.id) !== reqId) return;
-          const useCompressed = blob.size < image.originalSize;
-          const finalBlob = useCompressed ? blob : image.originalBlob;
+          const useCompressed = result.status === "compressed";
+          const finalBlob = useCompressed ? result.blob : image.originalBlob;
           const previewUrl = setPreviewUrl(
             image.id,
-            useCompressed ? blob : null
+            useCompressed ? result.blob : null
           );
           setCompressedBlobs((prev) => {
             const next = new Map(prev);
@@ -124,6 +126,7 @@ export function Dashboard({ file, zip, images, onReset }: DashboardProps) {
               isEstimating: false,
               estimateError: null,
               compressedPreviewUrl: previewUrl,
+              status: result.status,
             },
           }));
         })

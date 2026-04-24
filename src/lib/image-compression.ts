@@ -5,24 +5,38 @@
  * "Compress Pictures" presets):
  *
  *   1. Decode the source with createImageBitmap (falling back to <img>).
- *   2. Detect whether the image truly uses alpha. Many PNGs embedded in
- *      presentations are fully opaque and should be re-encoded as JPEG.
- *   3. Downsample the longest edge to a ratio-controlled cap. At ratio 0.1
- *      we cap around 720px (close to 96 PPI on a 16:9 slide); at 1.0 we
- *      keep the original pixel dimensions. This mirrors PowerPoint's
- *      150/220 PPI presets by limiting the actual pixel count.
- *   4. Encode opaque images as JPEG with a quality curve tuned to match
- *      Office's output; transparent images stay as PNG but are still
- *      downsampled.
- *   5. If the re-encoded blob is larger than the source, keep the source.
+ *   2. Detect whether the image truly uses alpha.
+ *   3. Downsample the output dimensions. The target edge is determined by
+ *      BOTH a ratio-controlled pixel cap AND a ratio-controlled scale
+ *      factor, so even images that are already below the cap still shrink
+ *      when the user picks a low ratio.
+ *   4. For opaque images, encode as JPEG. For images with real alpha,
+ *      encode as WebP (lossy, supports alpha) whenever it beats PNG.
+ *   5. Always compare against the source blob. If the re-encoded result
+ *      is still larger, fall back to the source and mark the image as
+ *      "already optimal" so the UI can communicate that clearly.
  */
 
-const MIN_DIMENSION = 64;
+const MIN_DIMENSION = 48;
 const MAX_PIXEL_EDGE = 4000;
 
 export type CompressOptions = {
   /** 0 < ratio <= 1. Lower = smaller file / lower quality. */
   ratio: number;
+};
+
+/** Status of the compression result. */
+export type CompressStatus =
+  | "compressed"
+  | "already-optimal"
+  | "unchanged-max-quality";
+
+export type CompressResult = {
+  blob: Blob;
+  /** Whether we actually produced a smaller file than the source. */
+  status: CompressStatus;
+  /** Size of the best candidate we produced, even if it wasn't adopted. */
+  attemptedSize: number;
 };
 
 type DecodedSource = {
@@ -100,11 +114,7 @@ function detectAlpha(
 
 /**
  * Map the slider ratio (0.1 - 1.0) to a maximum longest-edge in pixels.
- * ratio 0.10 -> 720 px   (aggressive)
- * ratio 0.25 -> 1024 px
- * ratio 0.50 -> 1600 px  (roughly PowerPoint "150 ppi")
- * ratio 0.75 -> 2400 px  (roughly "220 ppi")
- * ratio 1.00 -> no cap
+ * This is the absolute cap; images larger than this get downsampled.
  */
 function maxEdgeForRatio(ratio: number): number {
   if (ratio >= 0.99) return MAX_PIXEL_EDGE;
@@ -126,10 +136,36 @@ function maxEdgeForRatio(ratio: number): number {
   return MAX_PIXEL_EDGE;
 }
 
-/** Map ratio to JPEG quality in the 0.45 - 0.92 range. */
-function jpegQualityForRatio(ratio: number): number {
-  const q = 0.45 + ratio * 0.47;
-  return Math.min(0.95, Math.max(0.3, q));
+/**
+ * Additional scale factor applied on top of the edge cap. This keeps the
+ * slider meaningful for images that are already below the cap - at ratio
+ * 0.1 we still shrink small images to ~55% of their original dimensions.
+ */
+function extraScaleForRatio(ratio: number): number {
+  // Curve: 0.10 -> 0.55, 0.25 -> 0.70, 0.50 -> 0.85, 0.75 -> 0.95, 1.0 -> 1.0
+  if (ratio >= 1) return 1;
+  const stops: Array<[number, number]> = [
+    [0.1, 0.55],
+    [0.25, 0.7],
+    [0.5, 0.85],
+    [0.75, 0.95],
+    [1.0, 1.0],
+  ];
+  for (let i = 0; i < stops.length - 1; i++) {
+    const [r1, s1] = stops[i];
+    const [r2, s2] = stops[i + 1];
+    if (ratio <= r2) {
+      const t = (ratio - r1) / (r2 - r1);
+      return s1 + (s2 - s1) * t;
+    }
+  }
+  return 1;
+}
+
+/** JPEG / WebP quality curve: 0.35 at ratio 0.1, ~0.92 at ratio 1.0. */
+function qualityForRatio(ratio: number): number {
+  const q = 0.35 + ratio * 0.6;
+  return Math.min(0.95, Math.max(0.25, q));
 }
 
 async function canvasToBlob(
@@ -141,7 +177,7 @@ async function canvasToBlob(
     canvas.toBlob(
       (b) => {
         if (b) resolve(b);
-        else reject(new Error("Canvas toBlob returned null"));
+        else reject(new Error(`Canvas toBlob(${mime}) returned null`));
       },
       mime,
       quality
@@ -152,8 +188,9 @@ async function canvasToBlob(
 export async function compressImageBlob(
   source: Blob,
   { ratio }: CompressOptions
-): Promise<Blob> {
+): Promise<CompressResult> {
   const clampedRatio = Math.min(1, Math.max(0.05, ratio));
+  const quality = qualityForRatio(clampedRatio);
 
   const decoded = await loadBitmap(source);
   try {
@@ -161,10 +198,12 @@ export async function compressImageBlob(
     const srcH = decoded.height;
     const longest = Math.max(srcW, srcH);
 
-    const maxEdge = maxEdgeForRatio(clampedRatio);
-    const scale = longest > maxEdge ? maxEdge / longest : 1;
-    const targetW = Math.max(MIN_DIMENSION, Math.round(srcW * scale));
-    const targetH = Math.max(MIN_DIMENSION, Math.round(srcH * scale));
+    const edgeCap = maxEdgeForRatio(clampedRatio);
+    const capScale = longest > edgeCap ? edgeCap / longest : 1;
+    const totalScale = Math.min(1, capScale * extraScaleForRatio(clampedRatio));
+
+    const targetW = Math.max(MIN_DIMENSION, Math.round(srcW * totalScale));
+    const targetH = Math.max(MIN_DIMENSION, Math.round(srcH * totalScale));
 
     const canvas = document.createElement("canvas");
     canvas.width = targetW;
@@ -179,22 +218,18 @@ export async function compressImageBlob(
     const mightHaveAlpha = couldHaveAlpha(source.type);
     const hasAlpha = mightHaveAlpha ? detectAlpha(ctx, targetW, targetH) : false;
 
-    let outBlob: Blob;
+    const candidates: Blob[] = [];
+
     if (hasAlpha) {
-      outBlob = await canvasToBlob(canvas, "image/png", undefined);
-      if (clampedRatio < 0.5) {
-        try {
-          const webp = await canvasToBlob(
-            canvas,
-            "image/webp",
-            jpegQualityForRatio(clampedRatio)
-          );
-          if (webp.type === "image/webp" && webp.size < outBlob.size) {
-            outBlob = webp;
-          }
-        } catch {
-          // ignore
-        }
+      try {
+        candidates.push(await canvasToBlob(canvas, "image/webp", quality));
+      } catch {
+        // ignore WebP failures, fall back to PNG below
+      }
+      try {
+        candidates.push(await canvasToBlob(canvas, "image/png", undefined));
+      } catch {
+        // ignore
       }
     } else {
       const flat = document.createElement("canvas");
@@ -207,14 +242,51 @@ export async function compressImageBlob(
       flatCtx.imageSmoothingEnabled = true;
       flatCtx.imageSmoothingQuality = "high";
       flatCtx.drawImage(canvas, 0, 0);
-      outBlob = await canvasToBlob(
-        flat,
-        "image/jpeg",
-        jpegQualityForRatio(clampedRatio)
-      );
+      try {
+        candidates.push(await canvasToBlob(flat, "image/jpeg", quality));
+      } catch {
+        // ignore
+      }
+      try {
+        candidates.push(await canvasToBlob(flat, "image/webp", quality));
+      } catch {
+        // ignore
+      }
     }
 
-    return outBlob;
+    // Only accept candidates the browser actually encoded in the requested
+    // format. Safari may silently fall back to PNG for WebP, etc.
+    const valid = candidates.filter(
+      (c) =>
+        c.type === "image/webp" ||
+        c.type === "image/png" ||
+        c.type === "image/jpeg"
+    );
+    if (valid.length === 0) {
+      return {
+        blob: source,
+        status: "already-optimal",
+        attemptedSize: source.size,
+      };
+    }
+
+    valid.sort((a, b) => a.size - b.size);
+    const best = valid[0];
+
+    if (best.size < source.size) {
+      return {
+        blob: best,
+        status: "compressed",
+        attemptedSize: best.size,
+      };
+    }
+
+    return {
+      blob: source,
+      status:
+        clampedRatio >= 1 ? "unchanged-max-quality" : "already-optimal",
+      attemptedSize: best.size,
+    };
   } finally {
     decoded.cleanup();
   }

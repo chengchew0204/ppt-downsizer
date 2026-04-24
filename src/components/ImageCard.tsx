@@ -1,6 +1,5 @@
 "use client";
 
-import Image from "next/image";
 import { motion } from "framer-motion";
 import {
   CheckCircle2,
@@ -70,13 +69,12 @@ export function ImageCard({ image, state, onRatioChange, onOpen }: Props) {
             <ImageIcon className="h-10 w-10" />
           </div>
         ) : (
-          <Image
+          <img
             src={previewSrc}
             alt={image.name}
-            fill
-            unoptimized
-            sizes="(max-width: 768px) 100vw, (max-width: 1200px) 50vw, 33vw"
-            className="object-contain transition-transform duration-300 group-hover:scale-[1.02]"
+            loading="lazy"
+            decoding="async"
+            className="absolute inset-0 h-full w-full object-contain transition-transform duration-300 group-hover:scale-[1.02]"
           />
         )}
         <div className="absolute left-3 top-3 inline-flex max-w-[75%] items-center gap-1.5 rounded-full bg-black/70 px-2.5 py-1 text-[11px] font-medium text-white backdrop-blur-sm">

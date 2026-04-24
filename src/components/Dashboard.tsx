@@ -1,0 +1,401 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { motion } from "framer-motion";
+import { Download, ImageOff, Loader2, RotateCcw, Zap } from "lucide-react";
+import JSZip from "jszip";
+
+import { GlobalControls } from "@/components/GlobalControls";
+import { ImageCard, type ImageState } from "@/components/ImageCard";
+import { Button } from "@/components/ui/button";
+import { compressImageBlob } from "@/lib/image-compression";
+import {
+  buildOptimizedPptx,
+  triggerDownload,
+  type MediaImage,
+} from "@/lib/pptx";
+import { formatBytes } from "@/lib/utils";
+
+const DEBOUNCE_MS = 300;
+
+type DashboardProps = {
+  file: File;
+  zip: JSZip;
+  images: MediaImage[];
+  onReset: () => void;
+};
+
+export function Dashboard({ file, zip, images, onReset }: DashboardProps) {
+  const [globalRatio, setGlobalRatio] = useState(0.7);
+  const [states, setStates] = useState<Record<string, ImageState>>(() =>
+    Object.fromEntries(
+      images.map((img) => [
+        img.id,
+        {
+          ratio: 0.7,
+          estimatedSize: null,
+          isEstimating: false,
+          estimateError: null,
+        } as ImageState,
+      ])
+    )
+  );
+  const [compressedBlobs, setCompressedBlobs] = useState<Map<string, Blob>>(
+    new Map()
+  );
+  const [exporting, setExporting] = useState(false);
+
+  const debounceTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(
+    new Map()
+  );
+  const requestIds = useRef<Map<string, number>>(new Map());
+
+  const runEstimate = useCallback(
+    (image: MediaImage, ratio: number) => {
+      if (image.ext === "svg") {
+        setStates((prev) => ({
+          ...prev,
+          [image.id]: {
+            ...prev[image.id],
+            estimatedSize: image.originalSize,
+            isEstimating: false,
+            estimateError: null,
+          },
+        }));
+        setCompressedBlobs((prev) => {
+          const next = new Map(prev);
+          next.set(image.id, image.originalBlob);
+          return next;
+        });
+        return;
+      }
+
+      const reqId = (requestIds.current.get(image.id) ?? 0) + 1;
+      requestIds.current.set(image.id, reqId);
+
+      setStates((prev) => ({
+        ...prev,
+        [image.id]: {
+          ...prev[image.id],
+          isEstimating: true,
+          estimateError: null,
+        },
+      }));
+
+      compressImageBlob(image.originalBlob, { ratio })
+        .then((blob) => {
+          if (requestIds.current.get(image.id) !== reqId) return;
+          const finalBlob =
+            blob.size < image.originalSize ? blob : image.originalBlob;
+          setCompressedBlobs((prev) => {
+            const next = new Map(prev);
+            next.set(image.id, finalBlob);
+            return next;
+          });
+          setStates((prev) => ({
+            ...prev,
+            [image.id]: {
+              ...prev[image.id],
+              estimatedSize: finalBlob.size,
+              isEstimating: false,
+              estimateError: null,
+            },
+          }));
+        })
+        .catch((err: unknown) => {
+          if (requestIds.current.get(image.id) !== reqId) return;
+          setStates((prev) => ({
+            ...prev,
+            [image.id]: {
+              ...prev[image.id],
+              isEstimating: false,
+              estimateError:
+                err instanceof Error ? err.message : "Compression failed",
+            },
+          }));
+        });
+    },
+    []
+  );
+
+  const scheduleEstimate = useCallback(
+    (image: MediaImage, ratio: number) => {
+      const existing = debounceTimers.current.get(image.id);
+      if (existing) clearTimeout(existing);
+      const timer = setTimeout(() => {
+        debounceTimers.current.delete(image.id);
+        runEstimate(image, ratio);
+      }, DEBOUNCE_MS);
+      debounceTimers.current.set(image.id, timer);
+    },
+    [runEstimate]
+  );
+
+  useEffect(() => {
+    const handle = setTimeout(() => {
+      for (const image of images) {
+        runEstimate(image, 0.7);
+      }
+    }, 0);
+    const timers = debounceTimers.current;
+    return () => {
+      clearTimeout(handle);
+      for (const timer of timers.values()) clearTimeout(timer);
+      timers.clear();
+    };
+  }, [images, runEstimate]);
+
+  const handleRatioChange = useCallback(
+    (imageId: string, ratio: number) => {
+      setStates((prev) => ({
+        ...prev,
+        [imageId]: {
+          ...prev[imageId],
+          ratio,
+          isEstimating: true,
+        },
+      }));
+      const image = images.find((i) => i.id === imageId);
+      if (image) scheduleEstimate(image, ratio);
+    },
+    [images, scheduleEstimate]
+  );
+
+  const handleApplyGlobal = useCallback(() => {
+    setStates((prev) => {
+      const next: Record<string, ImageState> = { ...prev };
+      for (const img of images) {
+        next[img.id] = {
+          ...next[img.id],
+          ratio: globalRatio,
+          isEstimating: true,
+        };
+      }
+      return next;
+    });
+    for (const img of images) scheduleEstimate(img, globalRatio);
+  }, [globalRatio, images, scheduleEstimate]);
+
+  const totals = useMemo(() => {
+    const original = images.reduce((acc, i) => acc + i.originalSize, 0);
+    let estimated = 0;
+    let hasUnknown = false;
+    for (const img of images) {
+      const s = states[img.id];
+      if (s?.estimatedSize != null) {
+        estimated += s.estimatedSize;
+      } else {
+        estimated += img.originalSize;
+        hasUnknown = true;
+      }
+    }
+    const otherFiles = file.size - original;
+    const pptEstimate = Math.max(otherFiles, 0) + estimated;
+    return {
+      originalPpt: file.size,
+      estimatedPpt: pptEstimate,
+      imagesOriginal: original,
+      imagesEstimated: estimated,
+      hasUnknown,
+    };
+  }, [file.size, images, states]);
+
+  const savingsPct =
+    totals.originalPpt > 0
+      ? Math.round(
+          ((totals.originalPpt - totals.estimatedPpt) / totals.originalPpt) *
+            100
+        )
+      : 0;
+
+  const handleDownload = useCallback(async () => {
+    setExporting(true);
+    try {
+      const replacements = new Map<string, Blob>();
+      for (const img of images) {
+        const blob = compressedBlobs.get(img.id);
+        if (blob) replacements.set(img.path, blob);
+      }
+      const outBlob = await buildOptimizedPptx(zip, replacements);
+      const baseName = file.name.replace(/\.pptx$/i, "");
+      triggerDownload(outBlob, `${baseName}_downsized.pptx`);
+    } finally {
+      setExporting(false);
+    }
+  }, [compressedBlobs, file.name, images, zip]);
+
+  const anyEstimating = Object.values(states).some((s) => s.isEstimating);
+
+  if (images.length === 0) {
+    return (
+      <motion.div
+        initial={{ opacity: 0, y: 8 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="flex flex-col items-center justify-center gap-6 rounded-2xl border border-dashed border-zinc-300 bg-white/70 p-16 text-center dark:border-zinc-800 dark:bg-zinc-950/60"
+      >
+        <div className="flex h-16 w-16 items-center justify-center rounded-2xl border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
+          <ImageOff className="h-7 w-7 text-zinc-500" />
+        </div>
+        <div className="space-y-1.5">
+          <p className="text-base font-medium text-zinc-900 dark:text-zinc-50">
+            No images found in this presentation
+          </p>
+          <p className="text-sm text-zinc-500 dark:text-zinc-400">
+            The uploaded file doesn&apos;t contain any images under{" "}
+            <code className="rounded bg-zinc-100 px-1 py-0.5 text-[11px] dark:bg-zinc-800">
+              ppt/media/
+            </code>
+            . Try a different file.
+          </p>
+        </div>
+        <Button variant="outline" onClick={onReset}>
+          <RotateCcw className="h-4 w-4" />
+          Upload another file
+        </Button>
+      </motion.div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-8">
+      <motion.div
+        initial={{ opacity: 0, y: 8 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.3 }}
+        className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4"
+      >
+        <SummaryStat
+          label="Original PPT size"
+          value={formatBytes(totals.originalPpt)}
+          caption={file.name}
+        />
+        <SummaryStat
+          label="Estimated new size"
+          value={formatBytes(totals.estimatedPpt)}
+          caption={
+            totals.hasUnknown || anyEstimating
+              ? "Refining estimate..."
+              : "Based on current settings"
+          }
+          highlight
+        />
+        <SummaryStat
+          label="Estimated savings"
+          value={
+            totals.originalPpt > totals.estimatedPpt
+              ? `${savingsPct}% (${formatBytes(
+                  totals.originalPpt - totals.estimatedPpt
+                )})`
+              : "None yet"
+          }
+          caption={
+            totals.originalPpt > totals.estimatedPpt
+              ? "Smaller is better"
+              : "Try lower quality"
+          }
+        />
+        <SummaryStat
+          label="Images"
+          value={String(images.length)}
+          caption={`${formatBytes(totals.imagesOriginal)} in media`}
+        />
+      </motion.div>
+
+      <GlobalControls
+        ratio={globalRatio}
+        onRatioChange={setGlobalRatio}
+        onApplyToAll={handleApplyGlobal}
+        disabled={anyEstimating}
+      />
+
+      <div className="flex flex-col-reverse items-start justify-between gap-3 sm:flex-row sm:items-center">
+        <div className="flex items-center gap-3">
+          <Button variant="outline" size="sm" onClick={onReset}>
+            <RotateCcw className="h-4 w-4" />
+            New file
+          </Button>
+          {anyEstimating && (
+            <span className="inline-flex items-center gap-1.5 text-xs text-zinc-500 dark:text-zinc-400">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              Updating estimates
+            </span>
+          )}
+        </div>
+        <Button
+          size="lg"
+          onClick={handleDownload}
+          disabled={exporting || anyEstimating}
+        >
+          {exporting ? (
+            <>
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Building .pptx
+            </>
+          ) : (
+            <>
+              <Download className="h-4 w-4" />
+              Download optimized PPT
+            </>
+          )}
+        </Button>
+      </div>
+
+      <motion.div
+        layout
+        className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
+      >
+        {images.map((image) => (
+          <ImageCard
+            key={image.id}
+            image={image}
+            state={states[image.id]}
+            onRatioChange={(ratio) => handleRatioChange(image.id, ratio)}
+          />
+        ))}
+      </motion.div>
+    </div>
+  );
+}
+
+function SummaryStat({
+  label,
+  value,
+  caption,
+  highlight,
+}: {
+  label: string;
+  value: string;
+  caption?: string;
+  highlight?: boolean;
+}) {
+  return (
+    <div
+      className={
+        highlight
+          ? "rounded-2xl border border-zinc-950/10 bg-zinc-950 p-5 text-white shadow-sm dark:border-white/10 dark:bg-white dark:text-zinc-950"
+          : "rounded-2xl border border-zinc-200/80 bg-white p-5 shadow-sm dark:border-zinc-800/80 dark:bg-zinc-950"
+      }
+    >
+      <div className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
+        {highlight && <Zap className="h-3 w-3" />}
+        <span className={highlight ? "text-zinc-300 dark:text-zinc-600" : ""}>
+          {label}
+        </span>
+      </div>
+      <div className="mt-1 text-2xl font-semibold tabular-nums tracking-tight">
+        {value}
+      </div>
+      {caption && (
+        <div
+          className={
+            highlight
+              ? "mt-1 truncate text-xs text-zinc-400 dark:text-zinc-500"
+              : "mt-1 truncate text-xs text-zinc-500 dark:text-zinc-400"
+          }
+        >
+          {caption}
+        </div>
+      )}
+    </div>
+  );
+}
